@@ -3,18 +3,12 @@ import { Readability } from "@mozilla/readability";
 
 const MIN_TEXT_LENGTH = 400; // 自動判定時、これ未満ならReadabilityの結果を信用しない
 const EXAMPLE_URL = "https://kumamoto.jyrac.stki.org";
-
-const REMOVE_SELECTORS = [
-  "script", "style", "noscript", "img", "picture",
-  "video", "audio", "iframe", "svg", "link[rel='stylesheet']",
-  "canvas", "object", "embed",
-];
+const HTML_SIZE_LIMIT = 500_000; // これを超える巨大ページ(重いSVG図解等)ではReadability自体をスキップする
 
 export default {
   async fetch(request) {
     const url = new URL(request.url);
 
-    // モードのプレフィックス判定: /readability/<url> or /raw-strip/<url> or /<url>(自動)
     let pathname = url.pathname;
     let forcedMode = null; // null = 自動(推奨)
     if (pathname.startsWith("/readability/")) {
@@ -75,10 +69,15 @@ export default {
     }
 
     const html = await res.text();
+    const tooLarge = html.length > HTML_SIZE_LIMIT;
 
-    // Readabilityを試す（forcedModeがraw-stripのときはスキップ）
+    // 内部リンクをプロキシ経由に書き換える際に使うプレフィックス
+    const linkModePrefix =
+      forcedMode === "readability" ? "readability/" : forcedMode === "raw-strip" ? "raw-strip/" : "";
+
+    // --- Readabilityを試す（重いページ・raw-strip強制時はスキップしてCPUを節約） ---
     let article = null;
-    if (forcedMode !== "raw-strip") {
+    if (forcedMode !== "raw-strip" && !tooLarge) {
       try {
         const { document: readerDoc } = parseHTML(html);
         const reader = new Readability(readerDoc);
@@ -88,20 +87,12 @@ export default {
       }
     }
 
-    // 内部リンクをプロキシ経由に書き換える際に使うプレフィックス
-    // forcedModeがあれば同じモードを維持、無ければ自動判定(ルート)に流す
-    const linkModePrefix =
-      forcedMode === "readability" ? "readability/" : forcedMode === "raw-strip" ? "raw-strip/" : "";
-
-    // Readability結果を「実際に画像/SVG等を除去した後」の中身で評価する
-    // (除去前のtextContentだけで判定すると、本文がSVGの中のテキストだった場合などに
-    //  「文字数はあるのに除去したら空になる」というケースを見逃してしまうため)
+    // article.content を正規表現ベースで軽量に処理(DOM再構築しない)
     let readabilityBodyHtml = null;
     let readabilityFinalLength = 0;
     if (article && article.content) {
-      const { document: artDoc } = parseHTML(article.content);
-      const candidateHtml = finalizeFragment(artDoc, target, url.origin, linkModePrefix);
-      const candidateText = (artDoc.body ? artDoc.body.textContent : "").trim();
+      const candidateHtml = stripAndRewriteLinks(article.content, target, url.origin, linkModePrefix);
+      const candidateText = candidateHtml.replace(/<[^>]+>/g, "").trim();
       readabilityFinalLength = candidateText.length;
       if (readabilityFinalLength > 0) {
         readabilityBodyHtml = candidateHtml;
@@ -109,7 +100,9 @@ export default {
     }
 
     let mode;
-    if (forcedMode === "readability") {
+    if (tooLarge) {
+      mode = "raw-strip";
+    } else if (forcedMode === "readability") {
       mode = readabilityBodyHtml ? "readability" : "raw-strip";
     } else if (forcedMode === "raw-strip") {
       mode = "raw-strip";
@@ -123,14 +116,17 @@ export default {
       title = article.title || "text proxy";
       bodyHtml = readabilityBodyHtml;
     } else {
-      const { document: rawDoc } = parseHTML(html);
-      title = rawDoc.title || "text proxy";
-      bodyHtml = finalizeFragment(rawDoc, target, url.origin, linkModePrefix);
+      // raw-strip: DOMを組まず、正規表現でbody部分だけ抜き出して軽量処理
+      const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+      title = titleMatch ? decodeEntities(titleMatch[1].trim()) : "text proxy";
+
+      const bodyMatch = html.match(/<body[^>]*>([\s\S]*)<\/body>/i);
+      const bodySrc = bodyMatch ? bodyMatch[1] : html;
+      bodyHtml = stripAndRewriteLinks(bodySrc, target, url.origin, linkModePrefix);
     }
 
     title = escapeHtml(title);
 
-    // モード切り替えリンク（今見ているURL自体を別モードで開き直す）
     const linkFor = (prefix) => `${url.origin}${prefix}${raw}`;
     const nav = [
       { key: null, label: "自動(推奨)", href: linkFor("/") },
@@ -143,6 +139,10 @@ export default {
           : `<a href="${escapeHtml(item.href)}">${item.label}</a>`
       )
       .join(" | ");
+
+    const sizeNote = tooLarge
+      ? `<p class="meta">※元ページが大きすぎたため(${Math.round(html.length / 1000)}KB)、Readability解析をスキップしています</p>`
+      : "";
 
     const outHtml = `<!DOCTYPE html>
 <html lang="ja">
@@ -163,6 +163,7 @@ export default {
 <h1>${title}</h1>
 <p class="meta">元URL: <a href="${escapeHtml(target)}">${escapeHtml(target)}</a>　/　表示モード: ${mode}</p>
 <p class="nav">${nav}</p>
+${sizeNote}
 <hr>
 ${bodyHtml}
 </body>
@@ -172,32 +173,46 @@ ${bodyHtml}
   },
 };
 
-// フラグメント/ドキュメントから 画像等を除去 + リンクをプロキシ経由の絶対URLに書き換えて body.innerHTML を返す
-function finalizeFragment(doc, baseUrl, origin, modePrefix) {
-  REMOVE_SELECTORS.forEach((sel) => {
-    doc.querySelectorAll(sel).forEach((el) => el.remove());
-  });
+// HTML断片を文字列のまま軽量処理: 重い/不要なタグを除去し、<a href>をプロキシ経由の絶対URLに書き換える
+// (linkedomでDOMを組まないので、巨大なSVG等が含まれていてもCPUコストを低く抑えられる)
+function stripAndRewriteLinks(htmlFragment, baseUrl, origin, modePrefix) {
+  let out = htmlFragment
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, "")
+    .replace(/<svg[\s\S]*?<\/svg>/gi, "")
+    .replace(/<canvas[\s\S]*?<\/canvas>/gi, "")
+    .replace(/<video[\s\S]*?<\/video>/gi, "")
+    .replace(/<audio[\s\S]*?<\/audio>/gi, "")
+    .replace(/<iframe[\s\S]*?<\/iframe>/gi, "")
+    .replace(/<picture[\s\S]*?<\/picture>/gi, "")
+    .replace(/<object[\s\S]*?<\/object>/gi, "")
+    .replace(/<embed[^>]*>/gi, "")
+    .replace(/<img[^>]*>/gi, "")
+    .replace(/<link[^>]*rel=["']?stylesheet["']?[^>]*>/gi, "")
+    .replace(/\s(style|on\w+)="[^"]*"/gi, "")
+    .replace(/\s(style|on\w+)='[^']*'/gi, "");
 
-  doc.querySelectorAll("*").forEach((el) => {
-    el.removeAttribute("style");
-    [...(el.attributes || [])].forEach((attr) => {
-      if (attr.name.toLowerCase().startsWith("on")) el.removeAttribute(attr.name);
-    });
-  });
-
-  doc.querySelectorAll("a[href]").forEach((a) => {
-    const href = a.getAttribute("href");
-    if (!href) return;
-    if (/^(#|mailto:|tel:|javascript:)/i.test(href)) return; // ページ内リンク・メール・電話はそのまま
+  out = out.replace(/(<a\b[^>]*\bhref=)(["'])(.*?)\2/gi, (m, pre, quote, href) => {
+    if (!href || /^(#|mailto:|tel:|javascript:)/i.test(href)) return m;
     try {
       const abs = new URL(href, baseUrl).href;
-      a.setAttribute("href", `${origin}/${modePrefix}${abs}`);
+      return `${pre}${quote}${origin}/${modePrefix}${abs}${quote}`;
     } catch (_) {
-      // 不正なURLはそのまま放置
+      return m;
     }
   });
 
-  return doc.body ? doc.body.innerHTML : "";
+  return out;
+}
+
+function decodeEntities(s) {
+  return s
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
 }
 
 function escapeHtml(s) {
