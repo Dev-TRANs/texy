@@ -150,7 +150,7 @@ export default {
 </head>
 <body>
 <h1>${title}</h1>
-<p class="meta">元URL: <a href="${escapeHtml(url.origin + "/" + linkModePrefix + target)}">${escapeHtml(target)}</a>　/　表示モード: ${mode}</p>
+<p class="meta">元URL: <a href="${escapeHtml(target)}">${escapeHtml(target)}</a>　/　表示モード: ${mode}</p>
 <p class="nav">${nav}</p>
 <hr>
 ${bodyHtml}
