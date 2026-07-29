@@ -1,28 +1,50 @@
 import { parseHTML } from "linkedom";
 import { Readability } from "@mozilla/readability";
 
+const MIN_TEXT_LENGTH = 400; // 自動判定時、これ未満ならReadabilityの結果を信用しない
+const EXAMPLE_URL = "https://kumamoto.jyrac.stki.org";
+
+const REMOVE_SELECTORS = [
+  "script", "style", "noscript", "img", "picture",
+  "video", "audio", "iframe", "svg", "link[rel='stylesheet']",
+  "canvas", "object", "embed",
+];
+
 export default {
   async fetch(request) {
     const url = new URL(request.url);
 
-    // "/https://example.com/page" or "/https%3A%2F%2Fexample.com%2Fpage" どちらにも対応
-    let raw = url.pathname.slice(1) + url.search;
+    // モードのプレフィックス判定: /readability/<url> or /raw-strip/<url> or /<url>(自動)
+    let pathname = url.pathname;
+    let forcedMode = null; // null = 自動(推奨)
+    if (pathname.startsWith("/readability/")) {
+      forcedMode = "readability";
+      pathname = pathname.slice("/readability".length);
+    } else if (pathname.startsWith("/raw-strip/")) {
+      forcedMode = "raw-strip";
+      pathname = pathname.slice("/raw-strip".length);
+    }
+
+    let raw = pathname.slice(1) + url.search;
     if (!raw) {
       return new Response(
-        "使い方: https://proxy.stki.org/<対象URL>\n例: https://proxy.stki.org/https://www.yahoo.co.jp/xxx/yyy",
+        [
+          "使い方:",
+          "  https://proxy.stki.org/<対象URL>              … 自動判定(推奨)",
+          "  https://proxy.stki.org/readability/<対象URL>  … 常にReadability(記事型ページ向け)",
+          "  https://proxy.stki.org/raw-strip/<対象URL>    … 常に素ストリップ(ポータル/リンク集向け)",
+          "",
+          `例: https://proxy.stki.org/${EXAMPLE_URL}`,
+        ].join("\n"),
         { status: 400, headers: { "Content-Type": "text/plain; charset=utf-8" } }
       );
     }
 
     let target = raw;
     try {
-      // encodeURIComponentされたURLだった場合はデコードしておく
       if (/^https?%3A/i.test(target)) target = decodeURIComponent(target);
     } catch (_) {}
-
-    if (!/^https?:\/\//i.test(target)) {
-      target = "https://" + target;
-    }
+    if (!/^https?:\/\//i.test(target)) target = "https://" + target;
 
     let res;
     try {
@@ -41,71 +63,76 @@ export default {
     }
 
     if (!res.ok) {
-      return new Response(
-        `元サイトがエラーを返しました (status: ${res.status})`,
-        { status: 502, headers: { "Content-Type": "text/plain; charset=utf-8" } }
-      );
+      return new Response(`元サイトがエラーを返しました (status: ${res.status})`, {
+        status: 502,
+        headers: { "Content-Type": "text/plain; charset=utf-8" },
+      });
     }
 
     const contentType = res.headers.get("content-type") || "";
     if (!contentType.includes("html")) {
-      // 画像やPDFなど、HTML以外はそのまま素通しする
-      return new Response(res.body, {
-        headers: { "Content-Type": contentType },
-      });
+      return new Response(res.body, { headers: { "Content-Type": contentType } });
     }
 
     const html = await res.text();
 
-    // Readabilityで一度試す（記事型ページ向け）
+    // Readabilityを試す（forcedModeがraw-stripのときはスキップ）
     let article = null;
-    try {
-      const { document: readerDoc } = parseHTML(html);
-      const reader = new Readability(readerDoc);
-      article = reader.parse();
-    } catch (_) {
-      article = null;
+    if (forcedMode !== "raw-strip") {
+      try {
+        const { document: readerDoc } = parseHTML(html);
+        const reader = new Readability(readerDoc);
+        article = reader.parse();
+      } catch (_) {
+        article = null;
+      }
     }
 
-    // 抽出できた本文が短すぎる場合は「本文じゃなく重要な情報を捨てた」可能性が高いので、
-    // ポータル/リンク集/ログ羅列型ページ向けのフォールバックに切り替える
-    const MIN_TEXT_LENGTH = 400; // これ未満ならReadabilityの結果を信用しない
-    const readabilityOk =
-      article && article.content && (article.textContent || "").length >= MIN_TEXT_LENGTH;
+    const readabilityLength = article && article.textContent ? article.textContent.length : 0;
+    const readabilityAvailable = article && article.content;
 
-    let bodyHtml, title, mode;
-
-    if (readabilityOk) {
-      mode = "readability";
-      title = article.title || "text proxy";
-      bodyHtml = stripMediaTags(article.content);
-    } else {
-      // フォールバック: 元HTML全体から画像/CSS/JS/装飾だけを除去し、
-      // テキストとリンクはできる限りそのまま残す
+    let mode;
+    if (forcedMode === "readability") {
+      mode = readabilityAvailable ? "readability" : "raw-strip";
+    } else if (forcedMode === "raw-strip") {
       mode = "raw-strip";
+    } else {
+      mode = readabilityAvailable && readabilityLength >= MIN_TEXT_LENGTH ? "readability" : "raw-strip";
+    }
+
+    // 内部リンクをプロキシ経由に書き換える際に使うプレフィックス
+    // forcedModeがあれば同じモードを維持、無ければ自動判定(ルート)に流す
+    const linkModePrefix =
+      forcedMode === "readability" ? "readability/" : forcedMode === "raw-strip" ? "raw-strip/" : "";
+
+    let bodyHtml, title;
+
+    if (mode === "readability") {
+      title = article.title || "text proxy";
+      const { document: artDoc } = parseHTML(article.content);
+      bodyHtml = finalizeFragment(artDoc, target, url.origin, linkModePrefix);
+    } else {
       const { document: rawDoc } = parseHTML(html);
       title = rawDoc.title || "text proxy";
-
-      const removeSelectors = [
-        "script", "style", "noscript", "img", "picture",
-        "video", "audio", "iframe", "svg", "link[rel='stylesheet']",
-        "canvas", "object", "embed",
-      ];
-      removeSelectors.forEach((sel) => {
-        rawDoc.querySelectorAll(sel).forEach((el) => el.remove());
-      });
-      // インラインstyle属性・on*イベント属性も除去（軽量化のついでに安全性も少し上げる）
-      rawDoc.querySelectorAll("*").forEach((el) => {
-        el.removeAttribute("style");
-        [...el.attributes || []].forEach((attr) => {
-          if (attr.name.toLowerCase().startsWith("on")) el.removeAttribute(attr.name);
-        });
-      });
-
-      bodyHtml = rawDoc.body ? rawDoc.body.innerHTML : "";
+      bodyHtml = finalizeFragment(rawDoc, target, url.origin, linkModePrefix);
     }
 
     title = escapeHtml(title);
+
+    // モード切り替えリンク（今見ているURL自体を別モードで開き直す）
+    const linkFor = (prefix) => `${url.origin}${prefix}${raw}`;
+    const nav = [
+      { key: null, label: "自動(推奨)", href: linkFor("/") },
+      { key: "readability", label: "readability", href: linkFor("/readability/") },
+      { key: "raw-strip", label: "raw-strip", href: linkFor("/raw-strip/") },
+    ]
+      .map((item) =>
+        item.key === forcedMode
+          ? `<b>${item.label}</b>`
+          : `<a href="${escapeHtml(item.href)}">${item.label}</a>`
+      )
+      .join(" | ");
+
     const outHtml = `<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -117,37 +144,54 @@ export default {
   h1 { font-size: 1.3em; }
   a { color: #06c; }
   img, video, iframe { display: none; }
-  .meta { color: #888; font-size: 0.8em; margin-bottom: 1em; }
+  .meta { color: #888; font-size: 0.8em; margin-bottom: 0.4em; }
+  .nav { font-size: 0.85em; margin-bottom: 1em; }
 </style>
 </head>
 <body>
 <h1>${title}</h1>
-<p class="meta">元URL: <a href="${target}">${escapeHtml(target)}</a>　/　抽出モード: ${mode}</p>
+<p class="meta">元URL: <a href="${escapeHtml(url.origin + "/" + linkModePrefix + target)}">${escapeHtml(target)}</a>　/　表示モード: ${mode}</p>
+<p class="nav">${nav}</p>
 <hr>
 ${bodyHtml}
 </body>
 </html>`;
 
-    return new Response(outHtml, {
-      headers: { "Content-Type": "text/html; charset=utf-8" },
-    });
+    return new Response(outHtml, { headers: { "Content-Type": "text/html; charset=utf-8" } });
   },
 };
 
-function stripMediaTags(htmlStr) {
-  return htmlStr
-    .replace(/<img[^>]*>/gi, "")
-    .replace(/<picture[\s\S]*?<\/picture>/gi, "")
-    .replace(/<video[\s\S]*?<\/video>/gi, "")
-    .replace(/<audio[\s\S]*?<\/audio>/gi, "")
-    .replace(/<iframe[\s\S]*?<\/iframe>/gi, "")
-    .replace(/<svg[\s\S]*?<\/svg>/gi, "");
+// フラグメント/ドキュメントから 画像等を除去 + リンクをプロキシ経由の絶対URLに書き換えて body.innerHTML を返す
+function finalizeFragment(doc, baseUrl, origin, modePrefix) {
+  REMOVE_SELECTORS.forEach((sel) => {
+    doc.querySelectorAll(sel).forEach((el) => el.remove());
+  });
+
+  doc.querySelectorAll("*").forEach((el) => {
+    el.removeAttribute("style");
+    [...(el.attributes || [])].forEach((attr) => {
+      if (attr.name.toLowerCase().startsWith("on")) el.removeAttribute(attr.name);
+    });
+  });
+
+  doc.querySelectorAll("a[href]").forEach((a) => {
+    const href = a.getAttribute("href");
+    if (!href) return;
+    if (/^(#|mailto:|tel:|javascript:)/i.test(href)) return; // ページ内リンク・メール・電話はそのまま
+    try {
+      const abs = new URL(href, baseUrl).href;
+      a.setAttribute("href", `${origin}/${modePrefix}${abs}`);
+    } catch (_) {
+      // 不正なURLはそのまま放置
+    }
+  });
+
+  return doc.body ? doc.body.innerHTML : "";
 }
 
 function escapeHtml(s) {
   return s.replace(
     /[&<>"']/g,
-    (c) =>
-      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
   );
 }
