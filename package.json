@@ -1,0 +1,16 @@
+{
+  "name": "text-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "@mozilla/readability": "^0.5.0",
+    "linkedom": "^0.16.11"
+  },
+  "devDependencies": {
+    "wrangler": "^3.78.0"
+  }
+}

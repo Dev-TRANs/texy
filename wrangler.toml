@@ -1,0 +1,9 @@
+name = "text-proxy"
+main = "src/index.js"
+compatibility_date = "2026-07-01"
+compatibility_flags = ["nodejs_compat"]
+
+# 独自ドメインを使う場合はダッシュボードでルート設定するか、以下を有効化
+# routes = [
+#   { pattern = "proxy.stki.org/*", zone_name = "stki.org" }
+# ]
