@@ -88,30 +88,40 @@ export default {
       }
     }
 
-    const readabilityText = article && article.textContent ? article.textContent.trim() : "";
-    const readabilityAvailable = !!(article && article.content && readabilityText.length > 0);
-    const readabilityLength = readabilityText.length;
-
-    let mode;
-    if (forcedMode === "readability") {
-      mode = readabilityAvailable ? "readability" : "raw-strip";
-    } else if (forcedMode === "raw-strip") {
-      mode = "raw-strip";
-    } else {
-      mode = readabilityAvailable && readabilityLength >= MIN_TEXT_LENGTH ? "readability" : "raw-strip";
-    }
-
     // 内部リンクをプロキシ経由に書き換える際に使うプレフィックス
     // forcedModeがあれば同じモードを維持、無ければ自動判定(ルート)に流す
     const linkModePrefix =
       forcedMode === "readability" ? "readability/" : forcedMode === "raw-strip" ? "raw-strip/" : "";
 
+    // Readability結果を「実際に画像/SVG等を除去した後」の中身で評価する
+    // (除去前のtextContentだけで判定すると、本文がSVGの中のテキストだった場合などに
+    //  「文字数はあるのに除去したら空になる」というケースを見逃してしまうため)
+    let readabilityBodyHtml = null;
+    let readabilityFinalLength = 0;
+    if (article && article.content) {
+      const { document: artDoc } = parseHTML(article.content);
+      const candidateHtml = finalizeFragment(artDoc, target, url.origin, linkModePrefix);
+      const candidateText = (artDoc.body ? artDoc.body.textContent : "").trim();
+      readabilityFinalLength = candidateText.length;
+      if (readabilityFinalLength > 0) {
+        readabilityBodyHtml = candidateHtml;
+      }
+    }
+
+    let mode;
+    if (forcedMode === "readability") {
+      mode = readabilityBodyHtml ? "readability" : "raw-strip";
+    } else if (forcedMode === "raw-strip") {
+      mode = "raw-strip";
+    } else {
+      mode = readabilityBodyHtml && readabilityFinalLength >= MIN_TEXT_LENGTH ? "readability" : "raw-strip";
+    }
+
     let bodyHtml, title;
 
     if (mode === "readability") {
       title = article.title || "text proxy";
-      const { document: artDoc } = parseHTML(article.content);
-      bodyHtml = finalizeFragment(artDoc, target, url.origin, linkModePrefix);
+      bodyHtml = readabilityBodyHtml;
     } else {
       const { document: rawDoc } = parseHTML(html);
       title = rawDoc.title || "text proxy";
