@@ -88,8 +88,9 @@ export default {
       }
     }
 
-    const readabilityLength = article && article.textContent ? article.textContent.length : 0;
-    const readabilityAvailable = article && article.content;
+    const readabilityText = article && article.textContent ? article.textContent.trim() : "";
+    const readabilityAvailable = !!(article && article.content && readabilityText.length > 0);
+    const readabilityLength = readabilityText.length;
 
     let mode;
     if (forcedMode === "readability") {
