@@ -56,33 +56,56 @@ export default {
     }
 
     const html = await res.text();
-    const { document } = parseHTML(html);
 
+    // Readabilityで一度試す（記事型ページ向け）
     let article = null;
     try {
-      const reader = new Readability(document);
+      const { document: readerDoc } = parseHTML(html);
+      const reader = new Readability(readerDoc);
       article = reader.parse();
     } catch (_) {
       article = null;
     }
 
-    if (!article || !article.content) {
-      return new Response(
-        "本文の抽出に失敗しました。JavaScriptで描画されるサイト(SPA)の可能性があります。\n\n元URL: " +
-          target,
-        { status: 200, headers: { "Content-Type": "text/plain; charset=utf-8" } }
-      );
+    // 抽出できた本文が短すぎる場合は「本文じゃなく重要な情報を捨てた」可能性が高いので、
+    // ポータル/リンク集/ログ羅列型ページ向けのフォールバックに切り替える
+    const MIN_TEXT_LENGTH = 400; // これ未満ならReadabilityの結果を信用しない
+    const readabilityOk =
+      article && article.content && (article.textContent || "").length >= MIN_TEXT_LENGTH;
+
+    let bodyHtml, title, mode;
+
+    if (readabilityOk) {
+      mode = "readability";
+      title = article.title || "text proxy";
+      bodyHtml = stripMediaTags(article.content);
+    } else {
+      // フォールバック: 元HTML全体から画像/CSS/JS/装飾だけを除去し、
+      // テキストとリンクはできる限りそのまま残す
+      mode = "raw-strip";
+      const { document: rawDoc } = parseHTML(html);
+      title = rawDoc.title || "text proxy";
+
+      const removeSelectors = [
+        "script", "style", "noscript", "img", "picture",
+        "video", "audio", "iframe", "svg", "link[rel='stylesheet']",
+        "canvas", "object", "embed",
+      ];
+      removeSelectors.forEach((sel) => {
+        rawDoc.querySelectorAll(sel).forEach((el) => el.remove());
+      });
+      // インラインstyle属性・on*イベント属性も除去（軽量化のついでに安全性も少し上げる）
+      rawDoc.querySelectorAll("*").forEach((el) => {
+        el.removeAttribute("style");
+        [...el.attributes || []].forEach((attr) => {
+          if (attr.name.toLowerCase().startsWith("on")) el.removeAttribute(attr.name);
+        });
+      });
+
+      bodyHtml = rawDoc.body ? rawDoc.body.innerHTML : "";
     }
 
-    const stripped = article.content
-      .replace(/<img[^>]*>/gi, "")
-      .replace(/<picture[\s\S]*?<\/picture>/gi, "")
-      .replace(/<video[\s\S]*?<\/video>/gi, "")
-      .replace(/<audio[\s\S]*?<\/audio>/gi, "")
-      .replace(/<iframe[\s\S]*?<\/iframe>/gi, "")
-      .replace(/<svg[\s\S]*?<\/svg>/gi, "");
-
-    const title = escapeHtml(article.title || "text proxy");
+    title = escapeHtml(title);
     const outHtml = `<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -90,7 +113,7 @@ export default {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${title}</title>
 <style>
-  body { font-family: -apple-system, sans-serif; max-width: 640px; margin: 0 auto; padding: 16px; line-height: 1.8; color: #222; word-wrap: break-word; }
+  body { font-family: -apple-system, sans-serif; max-width: 680px; margin: 0 auto; padding: 16px; line-height: 1.8; color: #222; word-wrap: break-word; }
   h1 { font-size: 1.3em; }
   a { color: #06c; }
   img, video, iframe { display: none; }
@@ -99,9 +122,9 @@ export default {
 </head>
 <body>
 <h1>${title}</h1>
-<p class="meta">元URL: <a href="${target}">${escapeHtml(target)}</a></p>
+<p class="meta">元URL: <a href="${target}">${escapeHtml(target)}</a>　/　抽出モード: ${mode}</p>
 <hr>
-${stripped}
+${bodyHtml}
 </body>
 </html>`;
 
@@ -110,6 +133,16 @@ ${stripped}
     });
   },
 };
+
+function stripMediaTags(htmlStr) {
+  return htmlStr
+    .replace(/<img[^>]*>/gi, "")
+    .replace(/<picture[\s\S]*?<\/picture>/gi, "")
+    .replace(/<video[\s\S]*?<\/video>/gi, "")
+    .replace(/<audio[\s\S]*?<\/audio>/gi, "")
+    .replace(/<iframe[\s\S]*?<\/iframe>/gi, "")
+    .replace(/<svg[\s\S]*?<\/svg>/gi, "");
+}
 
 function escapeHtml(s) {
   return s.replace(
